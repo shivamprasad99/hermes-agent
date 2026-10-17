@@ -133,6 +133,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from utils import is_truthy_value
 
 # Pinned to the legacy module path so operator log filters keep matching.
 logger = logging.getLogger("gateway.platforms.google_chat")
@@ -142,6 +143,12 @@ _SUBSCRIPTION_PATH_RE = re.compile(r"^projects/(?P<project>[^/]+)/subscriptions/
 # (user OAuth required — see ``oauth.py``).
 _CHAT_SCOPES = ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/pubsub"]
 _MAX_TEXT_LENGTH = 4000  # Chat limit is 4096; leave margin.
+# Inbound reply context (thread starter / quoted message → ``reply_to_*``): cap on the injected
+# text, and on the bot-auth fetch so a slow Chat API never holds up the turn.
+_REPLY_CONTEXT_MAX_CHARS = 4000
+_REPLY_CONTEXT_FETCH_TIMEOUT = 5.0
+# cardsV2 / legacy card keys whose string values are user-visible text (card-only notifications).
+_CARD_TEXT_KEYS = frozenset({"title", "subtitle", "text", "topLabel", "bottomLabel"})
 _RATE_LIMIT_WARN_THRESHOLD = 5
 # Bounded outbound retry for transient 429/5xx so a true outage surfaces quickly.
 _RETRY_MAX_ATTEMPTS, _RETRY_BASE_DELAY, _RETRY_MAX_DELAY, _RETRY_JITTER = 3, 1.0, 8.0, 0.3
@@ -362,6 +369,55 @@ def _thread_body(text: str, thread_id: Optional[str]) -> dict[str, Any]:
     return body
 
 
+def _thread_starter_name(thread_name: str) -> Optional[str]:
+    """Best-effort resource name of a thread's first message. Observed, not documented by Google:
+    the first message of ``spaces/X/threads/K`` is ``spaces/X/messages/K.K`` (replies are
+    ``K.<other>``). Callers must treat a miss (404 / other thread) as "no context"."""
+    space, sep, key = (thread_name or "").partition("/threads/")
+    return f"{space}/messages/{key}.{key}" if sep and space and key and "/" not in key else None
+
+
+def _is_thread_reply(msg: dict[str, Any], thread_name: Optional[str]) -> bool:
+    """True when ``msg`` replies inside an existing thread. Uses the documented ``threadReply``
+    flag; payloads without it (relay) fall back to "not the thread's first message" by name."""
+    flag = msg.get("threadReply")
+    if isinstance(flag, bool):
+        return flag
+    starter, own_name = _thread_starter_name(thread_name or ""), msg.get("name") or ""
+    return bool(starter and own_name and own_name != starter)
+
+
+def _collect_card_text(node: Any, out: list[str]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _CARD_TEXT_KEYS and isinstance(value, str) and value.strip():
+                out.append(value.strip())
+            else:
+                _collect_card_text(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_card_text(item, out)
+
+
+def _message_context_text(msg: dict[str, Any]) -> str:
+    """Readable text of a Chat message for reply context: ``text`` → ``fallbackText`` → the
+    visible text of its cards (notifications are often card-only)."""
+    for key in ("text", "fallbackText"):
+        value = msg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    parts: list[str] = []
+    _collect_card_text([msg.get("cardsV2"), msg.get("cards")], parts)
+    return "\n".join(parts)
+
+
+def _bounded_context_text(text: str) -> Optional[str]:
+    text = (text or "").strip()
+    if len(text) > _REPLY_CONTEXT_MAX_CHARS:
+        text = text[:_REPLY_CONTEXT_MAX_CHARS].rstrip() + " […]"
+    return text or None
+
+
 def _create_kwargs(chat_id: str, body: dict[str, Any]) -> dict[str, Any]:
     """messages.create kwargs. With ``thread.name`` we MUST pass
     ``messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`` — the default silently
@@ -429,6 +485,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._bootstrap_spaces = str(
             extra.get("bootstrap_spaces") or _get_scoped_secret("GOOGLE_CHAT_BOOTSTRAP_SPACES", "") or "").strip()
         self._debug_raw = bool(extra.get("debug_raw") or _get_scoped_secret("GOOGLE_CHAT_DEBUG_RAW"))
+        # Fetch a thread's first message (or a quote whose snapshot is missing) with the bot's own
+        # credentials when the agent never saw it, e.g. notifications posted outside Hermes.
+        self._fetch_thread_context = is_truthy_value(extra.get("fetch_thread_context"), default=True)
         self._http_events_url = self._str_setting(extra, "http_events_url", "GOOGLE_CHAT_HTTP_EVENTS_URL")
         self._http_events_audience = self._str_setting(
             extra, "http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", self._http_events_url)
@@ -968,10 +1027,84 @@ class GoogleChatAdapter(BasePlatformAdapter):
             user_id=(sender_email or sender_name), user_name=sender.get("displayName") or sender_email or sender_name,
             thread_id=session_thread_id, user_id_alt=(sender_name or None), message_id=msg.get("name") or None,
         )
+        # Reply context rides on the user message via core's ``[Replying to: ...]`` prefix (never the
+        # system prompt). An explicit quote wins; otherwise, on the first turn Hermes sees in a thread,
+        # the thread's first message — typically a notification posted outside Hermes.
+        reply_to_id, reply_to_text, reply_to_author = await self._quoted_reply_context(msg)
+        if (not reply_to_text and self._fetch_thread_context and thread_name
+                and _is_thread_reply(msg, thread_name)
+                and (prev_thread_count == 0 or self._thread_session_missing(source))):
+            reply_to_id, reply_to_text = await self._thread_starter_context(thread_name)
         return MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=msg, message_id=msg.get("name") or None,
             media_urls=media_urls, media_types=media_types,
+            reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, reply_to_author_name=reply_to_author,
         )
+
+    def _thread_session_missing(self, source: Any) -> bool:
+        """True only when the session store is reachable and holds no live session for ``source``.
+        Covers threads Hermes itself started (outbound tracking already counted them) whose first
+        user reply still opens a fresh session. No store → False (the thread count decides)."""
+        store = getattr(self, "_session_store", None)
+        lookup = getattr(store, "lookup_by_session_key", None) if store is not None else None
+        if not callable(lookup):
+            return False
+        try:
+            entry = lookup(self._source_session_key(source))
+        except Exception:
+            logger.debug("[GoogleChat] session lookup for reply context failed", exc_info=True)
+            return False
+        return entry is None or bool(getattr(entry, "suspended", False))
+
+    async def _fetch_context_message(self, message_name: str) -> Optional[dict[str, Any]]:
+        """Bot-auth ``spaces.messages.get`` for reply context; None on any failure (fail open)."""
+        if not self._chat_api or not message_name:
+            return None
+        try:
+            resp = await asyncio.wait_for(asyncio.to_thread(
+                lambda: self._chat_api.spaces().messages().get(name=message_name).execute(
+                    http=self._new_authed_http())), _REPLY_CONTEXT_FETCH_TIMEOUT)
+        except Exception as exc:
+            logger.debug("[GoogleChat] reply-context fetch of %s failed: %s",
+                         message_name, _redact_sensitive(str(exc) or type(exc).__name__))
+            return None
+        return resp if isinstance(resp, dict) else None
+
+    async def _quoted_reply_context(self, msg: dict[str, Any]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """``(message_id, text, author_name)`` for a quote-reply: the payload's
+        ``quotedMessageSnapshot`` first, else a fetch of the quoted message. All None when absent."""
+        meta = msg.get("quotedMessageMetadata")
+        name = meta.get("name") if isinstance(meta, dict) else None
+        if not isinstance(name, str) or not name:
+            return None, None, None
+        snapshot = meta.get("quotedMessageSnapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        text, sender = _message_context_text(snapshot), snapshot.get("sender")
+        if not text and self._fetch_thread_context:
+            fetched = await self._fetch_context_message(name)
+            if fetched:
+                text, sender = _message_context_text(fetched), sender or fetched.get("sender")
+        # Snapshot ``sender`` is a display-name string; a fetched message carries a User object.
+        author = sender.get("displayName") if isinstance(sender, dict) else sender
+        bounded = _bounded_context_text(text)
+        if not bounded:
+            return None, None, None
+        return name, bounded, (author.strip() or None) if isinstance(author, str) else None
+
+    async def _thread_starter_context(self, thread_name: str) -> tuple[Optional[str], Optional[str]]:
+        """``(message_id, text)`` of the thread's first message, or ``(None, None)``."""
+        starter = _thread_starter_name(thread_name)
+        fetched = await self._fetch_context_message(starter) if starter else None
+        if not fetched:
+            logger.debug("[GoogleChat] no thread-starter context for %s", thread_name)
+            return None, None
+        # The ID scheme is a guess: only trust a hit that really belongs to this thread.
+        fetched_thread = (fetched.get("thread") or {}).get("name")
+        if fetched_thread and fetched_thread != thread_name:
+            logger.debug("[GoogleChat] guessed starter %s belongs to %s, not %s", starter, fetched_thread, thread_name)
+            return None, None
+        text = _bounded_context_text(_message_context_text(fetched))
+        return (fetched.get("name") or starter, text) if text else (None, None)
 
     async def _download_attachment(self, attachment: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         """Download an inbound attachment to the local cache; return (path, mime). Bot SA
