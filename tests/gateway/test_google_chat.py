@@ -719,6 +719,198 @@ class TestBuildMessageEvent:
 
 
 # ===========================================================================
+# Inbound reply context — thread starter / quoted message → reply_to_*
+# ===========================================================================
+
+
+def _thread_reply_envelope(text="approve", *, space="spaces/G", thread_key="T1", reply_key="R1",
+                           space_type="SPACE", thread_reply=True, quoted=None):
+    """A user's reply inside ``<space>/threads/<thread_key>`` (Workspace Add-ons shape)."""
+    env = _make_chat_envelope(text=text, msg_name=f"{space}/messages/{thread_key}.{reply_key}",
+                              thread_name=f"{space}/threads/{thread_key}")
+    payload = env["chat"]["messagePayload"]
+    payload["space"] = payload["message"]["space"] = {"name": space, "spaceType": space_type}
+    if thread_reply is not None:
+        payload["message"]["threadReply"] = thread_reply
+    if quoted is not None:
+        payload["message"]["quotedMessageMetadata"] = quoted
+    return env
+
+
+def _messages_get(adapter):
+    """The mocked ``spaces().messages().get`` callable on the bot client."""
+    return adapter._chat_api.spaces.return_value.messages.return_value.get
+
+
+def _serve_messages(adapter, by_name):
+    """Answer ``messages.get(name=...)`` from ``by_name``; unknown names raise a 404."""
+    def _get(name):
+        req = MagicMock()
+        if name in by_name:
+            req.execute.return_value = by_name[name]
+        else:
+            req.execute.side_effect = _FakeHttpError(404, reason="Not Found")
+        return req
+    _messages_get(adapter).side_effect = _get
+
+
+_NOTIFICATION = {
+    "name": "spaces/G/messages/T1.T1",
+    "sender": {"name": "users/app", "type": "BOT"},
+    "text": "Draft ready: 'Q3 launch post'. Reply approve to publish.",
+    "thread": {"name": "spaces/G/threads/T1"},
+}
+
+
+async def _deliver(adapter, env):
+    """Run the real inbound path and return the event handed to the gateway."""
+    await adapter.dispatch_http_event(env)
+    adapter.handle_message.assert_awaited_once()
+    return adapter.handle_message.await_args.args[0]
+
+
+class TestInboundReplyContext:
+    @pytest.mark.asyncio
+    async def test_first_reply_in_bot_started_thread_gets_starter_context(self, adapter):
+        """A notification posted outside Hermes never reaches the adapter; the first user reply in
+        its thread must carry it so the agent knows what "approve" refers to."""
+        from gateway.run_inbound import GatewayInboundMixin
+        _serve_messages(adapter, {_NOTIFICATION["name"]: _NOTIFICATION})
+
+        event = await _deliver(adapter, _thread_reply_envelope("approve"))
+
+        _messages_get(adapter).assert_called_once_with(name="spaces/G/messages/T1.T1")
+        assert event.text == "approve"  # trigger text untouched (command routing reads it)
+        assert event.reply_to_message_id == "spaces/G/messages/T1.T1"
+        assert event.reply_to_text == _NOTIFICATION["text"]
+        # Same app identity, but Hermes never wrote it: no "your previous message" framing.
+        assert event.reply_to_is_own_message is False
+        injected = GatewayInboundMixin._prepend_inbound_reply_context(event, event.source, event.text)
+        assert injected == f'[Replying to: "{_NOTIFICATION["text"]}"]\n\napprove'
+
+    @pytest.mark.asyncio
+    async def test_later_turns_in_the_thread_do_not_refetch(self, adapter):
+        _serve_messages(adapter, {_NOTIFICATION["name"]: _NOTIFICATION})
+        first = await adapter._build_message_event(*_msg_and_env(_thread_reply_envelope("approve")))
+        second = await adapter._build_message_event(
+            *_msg_and_env(_thread_reply_envelope("and schedule it", reply_key="R2")))
+        assert first.reply_to_text == _NOTIFICATION["text"]
+        assert second.reply_to_text is None and second.reply_to_message_id is None
+        assert _messages_get(adapter).call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_thread_hermes_posted_into_fetches_when_no_session_exists(self, adapter):
+        """Hermes's own deliveries are counted by outbound tracking, so the count alone says
+        "seen"; the missing session is what marks the first turn there."""
+        _serve_messages(adapter, {_NOTIFICATION["name"]: _NOTIFICATION})
+        adapter._thread_count_store.incr("spaces/G", "spaces/G/threads/T1")  # outbound delivery
+        adapter.set_session_store(MagicMock(lookup_by_session_key=MagicMock(return_value=None)))
+        event = await adapter._build_message_event(*_msg_and_env(_thread_reply_envelope()))
+        assert event.reply_to_text == _NOTIFICATION["text"]
+
+        adapter._session_store.lookup_by_session_key.return_value = MagicMock(suspended=False)
+        event = await adapter._build_message_event(*_msg_and_env(_thread_reply_envelope(reply_key="R2")))
+        assert event.reply_to_text is None
+        assert _messages_get(adapter).call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_quote_reply_uses_snapshot_over_thread_starter(self, adapter):
+        quoted = {
+            "name": "spaces/G/messages/T1.Q9",
+            "quotedMessageSnapshot": {"sender": "Priya", "text": "Traffic on /pricing dropped 40%"},
+        }
+        _serve_messages(adapter, {_NOTIFICATION["name"]: _NOTIFICATION})
+        event = await _deliver(adapter, _thread_reply_envelope("why did this page drop?", quoted=quoted))
+        assert event.reply_to_message_id == "spaces/G/messages/T1.Q9"
+        assert event.reply_to_text == "Traffic on /pricing dropped 40%"
+        assert event.reply_to_author_name == "Priya"
+        _messages_get(adapter).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_quote_without_snapshot_fetches_the_quoted_message(self, adapter):
+        quoted_msg = {"name": "spaces/G/messages/T1.Q9", "sender": {"name": "users/9", "displayName": "Priya"},
+                      "text": "Traffic on /pricing dropped 40%"}
+        _serve_messages(adapter, {quoted_msg["name"]: quoted_msg})
+        event = await _deliver(adapter, _thread_reply_envelope(quoted={"name": quoted_msg["name"]}))
+        _messages_get(adapter).assert_called_once_with(name="spaces/G/messages/T1.Q9")
+        assert event.reply_to_text == "Traffic on /pricing dropped 40%"
+        assert event.reply_to_author_name == "Priya"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["404", "403", "timeout"])
+    async def test_fetch_failure_still_delivers_the_message(self, adapter, monkeypatch, failure):
+        import time
+        import plugins.platforms.google_chat.adapter as gc_mod
+        if failure == "timeout":
+            monkeypatch.setattr(gc_mod, "_REPLY_CONTEXT_FETCH_TIMEOUT", 0.05)
+            _messages_get(adapter).return_value.execute.side_effect = lambda **_kw: time.sleep(0.5)
+        elif failure == "403":
+            _messages_get(adapter).return_value.execute.side_effect = _FakeHttpError(403, reason="Forbidden")
+        else:
+            _serve_messages(adapter, {})
+        event = await _deliver(adapter, _thread_reply_envelope("approve"))
+        assert event.text == "approve"
+        assert event.reply_to_text is None and event.reply_to_message_id is None
+
+    @pytest.mark.asyncio
+    async def test_top_level_dm_message_does_not_fetch(self, adapter):
+        """A top-level DM message opens its own thread (``threadReply`` false): nothing to fetch."""
+        env = _thread_reply_envelope("hola", space="spaces/D", reply_key="T1", space_type="DIRECT_MESSAGE",
+                                     thread_reply=False)
+        event = await _deliver(adapter, env)
+        _messages_get(adapter).assert_not_called()
+        assert event.reply_to_text is None
+        assert event.source.thread_id is None  # DM main-flow routing unchanged
+
+    @pytest.mark.asyncio
+    async def test_thread_first_message_without_thread_reply_flag_does_not_fetch(self, adapter):
+        """Relay payloads omit ``threadReply``: a message named ``K.K`` is the thread's own start."""
+        env = _thread_reply_envelope("ping", reply_key="T1", thread_reply=None)
+        event = await _deliver(adapter, env)
+        _messages_get(adapter).assert_not_called()
+        assert event.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_config(self, adapter):
+        adapter._fetch_thread_context = False
+        _serve_messages(adapter, {_NOTIFICATION["name"]: _NOTIFICATION})
+        event = await _deliver(adapter, _thread_reply_envelope(quoted={"name": "spaces/G/messages/T1.Q9"}))
+        _messages_get(adapter).assert_not_called()
+        assert event.reply_to_text is None
+
+    def test_config_flag_defaults_on_and_reads_extra(self):
+        assert GoogleChatAdapter(_base_config())._fetch_thread_context is True
+        assert GoogleChatAdapter(_base_config(fetch_thread_context=False))._fetch_thread_context is False
+        assert GoogleChatAdapter(_base_config(fetch_thread_context="false"))._fetch_thread_context is False
+
+    @pytest.mark.asyncio
+    async def test_guessed_starter_from_another_thread_is_ignored(self, adapter):
+        stray = dict(_NOTIFICATION, thread={"name": "spaces/G/threads/OTHER"})
+        _serve_messages(adapter, {_NOTIFICATION["name"]: stray})
+        event = await _deliver(adapter, _thread_reply_envelope())
+        assert event.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_card_only_starter_is_bounded(self, adapter):
+        """Card notifications carry no ``text``; their visible card text is used, capped."""
+        from plugins.platforms.google_chat.adapter import _REPLY_CONTEXT_MAX_CHARS
+        body = "x" * (_REPLY_CONTEXT_MAX_CHARS + 500)
+        card_msg = {"name": "spaces/G/messages/T1.T1", "thread": {"name": "spaces/G/threads/T1"},
+                    "cardsV2": [{"cardId": "c", "card": {
+                        "header": {"title": "Weekly SEO report"},
+                        "sections": [{"widgets": [{"textParagraph": {"text": body}}]}]}}]}
+        _serve_messages(adapter, {card_msg["name"]: card_msg})
+        event = await _deliver(adapter, _thread_reply_envelope())
+        assert event.reply_to_text.startswith("Weekly SEO report\nxxx")
+        assert event.reply_to_text.endswith(" […]")
+        assert len(event.reply_to_text) <= _REPLY_CONTEXT_MAX_CHARS + len(" […]")
+
+
+def _msg_and_env(env):
+    return env["chat"]["messagePayload"]["message"], env
+
+
+# ===========================================================================
 # send() — text, patch-in-place, chunking, error handling
 # ===========================================================================
 

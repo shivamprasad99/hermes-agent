@@ -245,6 +245,21 @@ Thread support: when a user replies inside a thread, Hermes detects the
 `thread.name` and posts its reply in the same thread, so each thread gets a
 separate Hermes session.
 
+Thread context: Google Chat never delivers messages an app posts itself, so a
+thread started by a notification (posted by another service with the same Chat
+app's credentials, or by a Hermes cron delivery) is invisible to the agent. On
+the first turn Hermes handles in such a thread, the adapter fetches the
+thread's first message with the bot's own credentials and passes it to the
+agent as `[Replying to: "…"]` on the user's message (capped at 4000
+characters). Quote-replies use the quoted message the same way. If the fetch
+fails, the message is delivered without context. To turn the fetch off:
+
+```yaml
+platforms:
+  google_chat:
+    fetch_thread_context: false   # default: true
+```
+
 ### Clarify questions as interactive cards
 
 When the agent asks a multiple-choice clarify question, the adapter renders it
