@@ -1901,7 +1901,8 @@ def register(ctx) -> None:
         # Chat caps text at 4096; margin for typing-marker patches and edit overhead.
         max_message_length=4000,
         emoji="💬",
-        allow_update_command=True,
+        # RocketAEO runs a patched branch; updates go through the fork, never /update from chat.
+        allow_update_command=False,
         platform_hint=(
             "You are on Google Chat. Limited markdown subset is rendered: *bold*, _italic_, ~strike~, `code`. "
             "No headings or lists. Message size limit: 4000 characters; longer responses are split across multiple "
