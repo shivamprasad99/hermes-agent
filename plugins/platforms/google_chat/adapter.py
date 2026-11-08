@@ -946,10 +946,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
             if event is None:
                 return
             text = (event.text or "").strip()
-            # The sender email (user_id_alt) is the per-user OAuth token key.
+            # The sender email (``user_id``; ``user_id_alt`` is the ``users/{id}`` resource name) is
+            # the per-user OAuth token key: the same key ``_send_file`` looks up, so a token
+            # granted here is the one an upload finds. No email -> the legacy shared slot.
+            setup_key = event.source.user_id if event.source is not None and "@" in (event.source.user_id or "") else None
             if text.startswith("/setup-files") and event.source is not None and await self._handle_setup_files_command(
                 chat_id=event.source.chat_id, thread_id=event.source.thread_id, raw_text=text,
-                sender_email=event.source.user_id_alt or None,
+                sender_email=setup_key,
             ):
                 return
             await self.handle_message(event)

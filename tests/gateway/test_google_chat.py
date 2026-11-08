@@ -1272,6 +1272,19 @@ class TestSetupFilesSlashCommand:
         adapter._handle_setup_files_command.assert_awaited_once()
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_setup_token_key_is_the_upload_lookup_key(self, adapter):
+        """The token /setup-files stores must be the one _send_file finds: both key on the
+        sender's email, never the ``users/{id}`` resource name (a token saved under
+        ``users_<id>.json`` was never found, so attachments kept falling back)."""
+        adapter._handle_setup_files_command = AsyncMock(return_value=True)
+        env = _make_chat_envelope(text="/setup-files start", sender_email="Alice@Example.com")
+        msg, envelope = _msg_and_env(env)
+        await adapter._dispatch_message(msg, envelope)
+        setup_key = adapter._handle_setup_files_command.await_args.kwargs["sender_email"]
+        upload_key = adapter._last_sender_by_chat["spaces/S"]
+        assert setup_key.strip().lower() == upload_key == "alice@example.com"
+
 
 class TestUserOAuthHelper:
     @staticmethod
