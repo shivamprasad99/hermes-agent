@@ -75,3 +75,24 @@ def test_ensure_deps_requests_every_extra_before_reporting_a_restart(monkeypatch
     with pytest.raises(pm.InstallError, match="google installed"):
         adapter.ensure_google_chat_deps()
     assert requested == ["google", "google-chat"]
+
+
+def test_required_pins_match_declared_extras():
+    """The staleness probe must pin exactly what the extras install: a drifted pin
+    (e.g. pubsub 2.39.0 vs a declared 2.39.2) can never be satisfied, so ``/setup-files
+    start`` fails on every healthy install."""
+    import tomllib
+    from pathlib import Path
+
+    from packaging.requirements import Requirement
+
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
+    extras = pyproject["project"]["optional-dependencies"]
+    declared = {}
+    for extra in oauth._DEPENDENCY_EXTRAS:
+        for spec in extras[extra]:
+            req = Requirement(spec)
+            declared[req.name] = str(req.specifier)
+    for spec in oauth._REQUIRED_PACKAGES:
+        req = Requirement(spec)
+        assert declared.get(req.name) == str(req.specifier), spec
